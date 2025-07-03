@@ -1,7 +1,6 @@
 package nano
 
 import (
-	"crypto/md5"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,7 +12,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,9 +25,6 @@ const (
 
 var registry sync.Map
 var _store *buntdb.DB
-var singleCharSet = lo.Map(lo.LowerCaseLettersCharset, func(item rune, _ int) string {
-	return string(item)
-})
 var validCharSet = append(lo.LowerCaseLettersCharset, lo.NumbersCharset...)
 
 func init() {
@@ -65,24 +61,24 @@ func SchemaSpace() string {
 }
 
 type DB struct {
+
 	// name is the unique identifier for this database instance.
 	name string
+
 	// namespace is a unique prefix for all keys belonging to this DB.
 	// It helps in isolating data for different logical databases within the same buntdb instance.
-	// For example, if namespace is "users", all keys for this DB will be stored as "users:key".
+	// For example, if namespace is "u", all keys for this DB will be stored as "u:key".
+	// namespace is typically a single character or a short string to minimize storage overhead.
 	namespace string
-
-	// version is the version of the database schema.
-	// It can be used to manage schema migrations or versioning of the database structure.
-	version string
 
 	// schema stores the mapping between original JSON field names and their shortened representations.
 	// This map is used for optimizing storage by replacing long field names with shorter ones (e.g., "firstName" -> "f1").
 	// It's persisted to buntdb to ensure consistency across application restarts.
 	// The key is the original field name, and the value is the shortened field name.
 	schema map[string]string
-
-	s2l map[string]string
+	// mu is a RWMutex to protect concurrent access to the DB's fields,
+	// especially during schema updates or data access.
+	mu sync.RWMutex
 }
 
 // MarshalJSON implements the json.Marshaler interface for DB.
@@ -93,7 +89,6 @@ func (db *DB) MarshalJSON() ([]byte, error) {
 		Schema    map[string]string `json:"schema"`
 	}{
 		Namespace: db.namespace,
-		Version:   db.version,
 		Schema:    db.schema,
 	})
 }
@@ -109,7 +104,6 @@ func (db *DB) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	db.namespace = aux.Namespace
-	db.version = aux.Version
 	db.schema = aux.Schema
 	return nil
 }
@@ -195,11 +189,13 @@ func (db *DB) Key(key string) string {
 	return fmt.Sprintf("%s%s%s", db.namespace, keySeparator, key)
 }
 
-// dbKey constructs a key for storing the DB's metadata in buntdb.
-// This key is used internally to persist the DB's namespace and schema.
-// The format is "namespace:dbName".
+// dbKey constructs the internal key used to store the DB's schema and metadata
+// within the buntdb instance. This key is prefixed with `_schema:` to
+// distinguish it from user data and includes the database's name to make it unique.
+// Example: "_schema:my_db_name"
+
 func (db *DB) dbKey() string {
-	return fmt.Sprintf("%s%s%s", db.namespace, keySeparator, db.name)
+	return fmt.Sprintf("%s%s%s", schemaSpacePrefix, keySeparator, db.name)
 }
 
 // Set stores a key-value pair in the database.
@@ -221,21 +217,16 @@ func (db *DB) SetWithTTL(key, value string, ttl time.Duration) mo.Result[string]
 	var pre string
 	opt := lo.If(ttl > 0, &buntdb.SetOptions{Expires: true, TTL: ttl}).Else(nil)
 	_ = _store.Update(func(tx *buntdb.Tx) error {
-		// if its a valid JSON, we will shorten it
+		// if it is a valid JSON, we will shorten it
 		if gjson.Valid(value) {
 			// If the value is a valid JSON, we shorten it using our schema
-			value = db.shorten(tx, value)
+			result := db.shorten(tx, value)
+			fmt.Println(result)
 		}
 		pre, _, err = tx.Set(db.Key(key), value, opt)
 		return err
 	})
 	return lo.If(err != nil, mo.Err[string](err)).Else(mo.Ok(pre))
-}
-
-func version(props []string) string {
-	slices.Sort(props)
-	keys := strings.Join(props, ",")
-	return fmt.Sprintf("%x", md5.Sum([]byte(keys)))
 }
 
 func (db *DB) Get(key string) mo.Result[string] {
@@ -248,51 +239,223 @@ func (db *DB) Get(key string) mo.Result[string] {
 	return lo.If(err != nil, mo.Err[string](err)).Else(mo.Ok(v))
 }
 
-func (db *DB) shorten(tx *buntdb.Tx, payload string) string {
-	keys := lo.Map(gjson.Get(payload, "@keys").Array(), func(item gjson.Result, _ int) string {
-		return item.Str
-	})
-	if version(keys) != db.version {
-		single := lo.Without(singleCharSet, lo.Values(db.schema)...)
-		lo.ForEach(keys, func(key string, _ int) {
-			if _, ok := db.schema[key]; !ok {
-				chosen, ok := lo.Last(single)
-				if ok {
-					single = lo.DropRight(single, 1)
-				} else {
-					_, _ = lo.AttemptWhile(-1, func(i int) (error, bool) {
-						chosen = fmt.Sprintf("%s%s", lo.RandomString(1, lo.LowerCaseLettersCharset), lo.RandomString(1, validCharSet))
-						return nil, !lo.Contains(lo.Values(db.schema), chosen)
-					})
-				}
-				db.schema[key] = chosen
-			}
-		})
+// shortKey generates a unique short key for a new field in the schema.
+// It prioritizes single-character lowercase letters (a-z).
+// If all single characters are used, it moves to two-character keys,
+// starting with a lowercase letter and followed by any character from `validCharSet` (a-z, 0-9).
+// This ensures a compact and deterministic key generation.
+func (db *DB) shortKey() string {
+	usedShortKeys := make(map[string]struct{}, len(db.schema))
+	for _, shortKey := range db.schema {
+		usedShortKeys[shortKey] = struct{}{}
 	}
-	db.version = version(keys)
-	data, _ := db.MarshalJSON()
-	_, _, err := tx.Set(db.dbKey(), string(data), nil)
-	if err != nil {
-		log.Printf("failed to update schema for db %s: %v", db.name, err)
-		return payload // Return original payload if schema update fails
-	}
-	registry.Store(db.name, db)
-
-	// Now, apply the shortening to the payload
-	var m map[string]interface{}
-	_ = json.Unmarshal([]byte(payload), &m)
-	shortenedMap := make(map[string]interface{})
-	for k, v := range m {
-		if shortKey, ok := db.schema[k]; ok {
-			shortenedMap[shortKey] = v
-		} else {
-			// This case should ideally not happen if schema is updated correctly
-			shortenedMap[k] = v
+	// Policy 1: Find the first available single-character key.
+	// singleCharSet is already sorted 'a' through 'z'.
+	for _, char := range lo.LowerCaseLettersCharset {
+		cs := string(char)
+		if _, ok := usedShortKeys[cs]; !ok {
+			return cs
 		}
 	}
-	shortenedPayload, _ := json.Marshal(shortenedMap)
-	return string(shortenedPayload)
-	// update db.version
-	// persistent the schema to the store
-	// refresh the registry
+	// Policy 2: All single characters are used. Find the first available two-character key.
+	// This deterministic loop is more robust and predictable than random generation.
+	for _, c1 := range lo.LowerCaseLettersCharset {
+		for _, c2 := range validCharSet {
+			key := string(c1) + string(c2)
+			if _, ok := usedShortKeys[key]; !ok {
+				return key
+			}
+		}
+	}
+	// Fallback for the highly unlikely case that all 962 (26 + 26*36) keys are used.
+	// This prevents an infinite loop and ensures the system can continue.
+	return fmt.Sprintf("k%d", len(usedShortKeys))
+}
+
+func (db *DB) shorten(tx *buntdb.Tx, payload string) mo.Result[string] {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	longKeys := lo.Map(gjson.Get(payload, "@keys").Array(), func(item gjson.Result, _ int) string {
+		return item.Str
+	})
+	if len(longKeys) == 0 {
+		return mo.Ok(payload)
+	}
+	// 1. Detect if the schema needs to evolve by checking for new keys.
+	var schemaEvolved bool
+	for _, key := range longKeys {
+		if _, ok := db.schema[key]; !ok {
+			db.schema[key] = db.shortKey()
+			schemaEvolved = true
+		}
+	}
+	if schemaEvolved {
+		data, err := db.MarshalJSON()
+		if err != nil {
+			return mo.Err[string](fmt.Errorf("failed to marshal updated db schema: %w", err))
+		}
+		if _, _, err := tx.Set(db.dbKey(), string(data), nil); err != nil {
+			return mo.Err[string](fmt.Errorf("failed to persist updated db schema: %w", err))
+		}
+		registry.Store(db.name, db)
+	}
+
+	// 2. Perform the transformation without a full unmarshal/marshal cycle.
+	var builder strings.Builder
+	// Pre-allocating the builder's capacity close to the original payload size
+	// can prevent multiple re-allocations for large JSON objects.
+	builder.Grow(len(payload))
+	builder.WriteString("{")
+	var transformErr error
+	first := true
+	// Use gjson.Parse().ForEach to iterate through the object efficiently.
+	gjson.Parse(payload).ForEach(func(key, value gjson.Result) bool {
+		shortKey, ok := db.schema[key.String()]
+		if !ok {
+			transformErr = fmt.Errorf("internal error: schema missing key '%s' after evolution", key.String())
+			return false // Stop iterating on error
+		}
+		if !first {
+			builder.WriteString(",")
+		}
+		first = false
+		// Write the shortened key, ensuring it's a valid JSON string literal.
+		builder.WriteString(strconv.Quote(shortKey))
+		builder.WriteString(":")
+		// Write the raw value directly from the original payload.
+		builder.WriteString(value.Raw)
+		return true // Continue iterating
+	})
+
+	if transformErr != nil {
+		return mo.Err[string](transformErr)
+	}
+	builder.WriteString("}")
+	return mo.Ok(builder.String())
+}
+
+// Raw represents a raw JSON value retrieved from the database.
+// It's a wrapper around the underlying JSON parser's result type
+// to provide a stable, implementation-agnostic API.
+type Raw gjson.Result
+
+// Exists returns true if the value exists.
+func (r Raw) Exists() bool {
+	return gjson.Result(r).Exists()
+}
+
+// String returns the value as a string.
+func (r Raw) String() string {
+	return gjson.Result(r).String()
+}
+
+// Int returns the value as an int64.
+func (r Raw) Int() int64 {
+	return gjson.Result(r).Int()
+}
+
+// Float returns the value as a float64.
+func (r Raw) Float() float64 {
+	return gjson.Result(r).Float()
+}
+
+// Bool returns the value as a boolean.
+func (r Raw) Bool() bool {
+	return gjson.Result(r).Bool()
+}
+
+// Value returns the value as an interface{}.
+func (r Raw) Value() interface{} {
+	return gjson.Result(r).Value()
+}
+
+// GetPath retrieves a specific value from a JSON object stored in the database
+// using a dot-notation path. This is highly efficient for accessing single properties
+// as it avoids the overhead of rehydrating the entire JSON object.
+// Example: db.GetPath("1", "profile.name")
+func (db *DB) GetPath(key, path string) mo.Result[Raw] {
+	// 1. Translate the user-friendly path to the shortened path.
+	// We need a read lock to safely access the schema.
+	db.mu.RLock()
+	pathSegments := strings.Split(path, ".")
+	shortenedSegments := make([]string, len(pathSegments))
+	for i, segment := range pathSegments {
+		// If the segment is a key in our schema, translate it.
+		// Otherwise, assume it's an array index or a key that isn't shortened.
+		if shortKey, ok := db.schema[segment]; ok {
+			shortenedSegments[i] = shortKey
+		} else {
+			shortenedSegments[i] = segment
+		}
+	}
+	shortenedPath := strings.Join(shortenedSegments, ".")
+	db.mu.RUnlock() // Release the lock as soon as we're done with the schema.
+
+	// 2. Retrieve the raw, shortened payload from the database.
+	var v string
+	var err error
+	err = _store.View(func(tx *buntdb.Tx) error {
+		v, err = tx.Get(db.Key(key))
+		return err
+	})
+
+	if err != nil {
+		return mo.Err[Raw](err)
+	}
+
+	// 3. Use gjson on the shortened payload with the shortened path.
+	result := gjson.Get(v, shortenedPath)
+	return mo.Ok(Raw(result))
+}
+
+// rehydrate transforms a shortened JSON payload back into its original, readable form.
+// It is the inverse of the shorten function.
+func (db *DB) rehydrate(payload string) mo.Result[string] {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
+	if len(db.schema) == 0 || !gjson.Valid(payload) {
+		return mo.Ok(payload) // No schema or not a valid JSON object, so nothing to do.
+	}
+
+	// Create a reverse map for efficient lookups (short -> long).
+	reverseSchema := make(map[string]string, len(db.schema))
+	for long, short := range db.schema {
+		reverseSchema[short] = long
+	}
+
+	var builder strings.Builder
+	builder.Grow(len(payload))
+	builder.WriteString("{")
+
+	var transformErr error
+	first := true
+	gjson.Parse(payload).ForEach(func(key, value gjson.Result) bool {
+		longKey, ok := reverseSchema[key.String()]
+		if !ok {
+			// A key exists that is not in our schema. This could be a mixed payload
+			// or an error. The safest action is to return the payload as-is
+			// rather than a partially rehydrated one.
+			transformErr = errors.New("payload contains keys not in schema, cannot rehydrate")
+			return false // Stop iterating
+		}
+
+		if !first {
+			builder.WriteString(",")
+		}
+		first = false
+
+		builder.WriteString(strconv.Quote(longKey))
+		builder.WriteString(":")
+		builder.WriteString(value.Raw)
+		return true
+	})
+
+	if transformErr != nil {
+		// If we stopped because of an unknown key, it's safer to return the original payload.
+		return mo.Ok(payload)
+	}
+
+	builder.WriteString("}")
+	return mo.Ok(builder.String())
 }
