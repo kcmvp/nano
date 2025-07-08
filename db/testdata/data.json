@@ -1,0 +1,25 @@
+{
+  "property": "severities",
+  "values": [
+    {
+      "val": "MINOR",
+      "count": 888
+    },
+    {
+      "val": "MAJOR",
+      "count": 435
+    },
+    {
+      "val": "CRITICAL",
+      "count": 123
+    },
+    {
+      "val": "BLOCKER",
+      "count": 11
+    },
+    {
+      "val": "INFO",
+      "count": 7
+    }
+  ]
+}
