@@ -3,6 +3,7 @@ package db
 import (
 	"github.com/kcmvp/nano/internal"
 	"github.com/samber/mo"
+	"github.com/tidwall/gjson"
 	"time"
 )
 
@@ -27,18 +28,20 @@ func All() []Schema {
 
 func Set(dbName string) func(key, value string) mo.Result[string] {
 	return func(key, value string) mo.Result[string] {
-		panic("todo")
+		return SetWithTTL(dbName)(key, value, 0)
 	}
 }
 
 func SetWithTTL(dbName string) func(key, value string, ttl time.Duration) mo.Result[string] {
 	return func(key, value string, ttl time.Duration) mo.Result[string] {
-		panic("todo")
+		return internal.IS().Set(dbName, key, value)
 	}
 }
 
+type Raw gjson.Result
+
 func Get(dbName string) func(key string) mo.Result[string] {
 	return func(key string) mo.Result[string] {
-		panic("")
+		return internal.IS().Get(dbName, key)
 	}
 }
