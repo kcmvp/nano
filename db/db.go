@@ -34,7 +34,8 @@ func Set(dbName string) func(key, value string) mo.Result[string] {
 
 func SetWithTTL(dbName string) func(key, value string, ttl time.Duration) mo.Result[string] {
 	return func(key, value string, ttl time.Duration) mo.Result[string] {
-		return internal.IS().Set(dbName, key, value)
+		//return internal.IS().Set(dbName, key, value)
+		panic("@todo")
 	}
 }
 

@@ -21,9 +21,13 @@ type StoreTestSuit struct {
 
 func (st *StoreTestSuit) TearDownSuite() {
 	log.Println("reset database")
-	if err := os.RemoveAll(storePath); err != nil {
+	if err := os.RemoveAll(DataDir()); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func TestSchemaSpace(t *testing.T) {
+	assert.Equal(t, "_schema:*", SchemaSpace())
 }
 
 func TestStoreTestSuit(t *testing.T) {
@@ -33,7 +37,7 @@ func TestStoreTestSuit(t *testing.T) {
 func (st *StoreTestSuit) TestRegistry() {
 	var err error
 	name := lo.RandomString(10, lo.LowerCaseLettersCharset)
-	baisc := name
+	basic := name
 	prefix := lo.RandomString(5, lo.LowerCaseLettersCharset)
 	err = IS().Registry(name, string(prefix))
 	assert.Nil(st.T(), err)
@@ -68,7 +72,7 @@ func (st *StoreTestSuit) TestRegistry() {
 	var dbs []string
 	_ = IS().impl.View(func(tx *buntdb.Tx) error {
 		return tx.AscendKeys(SchemaSpace(), func(key, value string) bool {
-			if strings.HasSuffix(key, baisc) {
+			if strings.HasSuffix(key, basic) {
 				dbs = append(dbs, key)
 			}
 			return true
@@ -76,8 +80,8 @@ func (st *StoreTestSuit) TestRegistry() {
 	})
 	assert.Len(st.T(), dbs, 2)
 	assert.True(st.T(), lo.EveryBy(dbs, func(item string) bool {
-		return strings.HasSuffix(item, baisc) && strings.HasPrefix(item, schemaSpacePrefix)
-	}), "should have suffix %s", baisc)
+		return strings.HasSuffix(item, basic) && strings.HasPrefix(item, schemaSpacePrefix)
+	}), "should have suffix %s", basic)
 	lo.ForEach(lo.Map(dbs, func(item string, _ int) string {
 		return strings.Split(item, keySeparator)[1]
 	}), func(item string, _ int) {

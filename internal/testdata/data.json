@@ -21,5 +21,44 @@
       "val": "INFO",
       "count": 7
     }
-  ]
+  ],
+  "c": "simpleTest-c",
+  "d": "simpleTest-d",
+  "key": "AZHf6k6ZE1gjMEJpDwAK",
+  "rule": "java:S1128",
+  "severity": "MINOR",
+  "component": "com.happyflow:allinpay-channel:src/main/java/com/welab/allinpay/channel/AllinpayApplication.java",
+  "project": "com.happyflow:allinpay-channel",
+  "line": 5,
+  "hash": "1efef9aa4bd777dcd9e08c87978383bd",
+  "textRange": {
+    "startLine": 5,
+    "endLine": 5,
+    "startOffset": 7,
+    "endOffset": 69
+  },
+  "flows": [],
+  "status": "OPEN",
+  "message": "Remove this unused import 'org.springframework.boot.autoconfigure.EnableAutoConfiguration'.",
+  "effort": "2min",
+  "debt": "2min",
+  "author": "tony.deng@wolaidai.com",
+  "tags": [
+    "unused"
+  ],
+  "creationDate": "2020-03-13T07:19:35+0000",
+  "updateDate": "2024-09-11T07:08:52+0000",
+  "type": "CODE_SMELL",
+  "scope": "MAIN",
+  "quickFixAvailable": true,
+  "messageFormattings": [],
+  "total": 1164,
+  "p": 1234,
+  "ps": 100,
+  "paging": {
+    "pageIndex": 1,
+    "pageSize": 100,
+    "total": 1164
+  },
+  "effortTotal": 7561
 }

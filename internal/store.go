@@ -7,9 +7,11 @@ import (
 	"github.com/kcmvp/nano"
 	"github.com/samber/lo"
 	"github.com/samber/mo"
+	"github.com/spf13/viper"
 	"github.com/tidwall/buntdb"
 	"github.com/tidwall/gjson"
 	"log"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -28,6 +30,7 @@ var validCharSet = append(lo.LowerCaseLettersCharset, lo.NumbersCharset...)
 
 var store *Store
 var once sync.Once
+var cfg *viper.Viper
 var storePath string
 
 // Store is the main struct for interacting with the database.
@@ -38,15 +41,47 @@ type Store struct {
 	schemas sync.Map
 }
 
+func init() {
+	cfg = viper.New()
+	cfg.SetConfigName("app")
+	cfg.SetConfigType("yaml")
+	if executable, err := os.Executable(); err == nil {
+		cfg.AddConfigPath(filepath.Dir(executable))
+	} else {
+		log.Fatalf("could not determine executable path, will not be searched %v", err)
+	}
+	cfg.AddConfigPath(".")
+	cfg.AddConfigPath("../")
+	cfg.AutomaticEnv()
+	cfg.SetEnvKeyReplacer(strings.NewReplacer(".", "_")) // gitlab.token => GITLAB_TOKEN
+	// Attempt to read the configuration file.
+	if err := cfg.ReadInConfig(); err != nil {
+		var configFileNotFoundError viper.ConfigFileNotFoundError
+		if errors.As(err, &configFileNotFoundError) {
+			slog.Info("config file not found, using environment variables or defaults")
+		}
+	}
+}
+
+// DataDir returns the path to the directory where Nano stores its data,
+// including the BuntDB database file and configuration.
+// This path is determined by the `nano.data` configuration setting,
+// or defaults to `~/.nino` if not specified.
+func DataDir() string {
+	return storePath
+}
+
 func IS() *Store {
 	once.Do(func() {
-		u, err := user.Current()
-		if err != nil {
-			log.Fatalf("failed to get current user %v", err)
+		storePath = cfg.GetString("nano.data")
+		if len(storePath) < 0 {
+			u, err := user.Current()
+			if err != nil {
+				log.Fatalf("failed to get current user %v", err)
+			}
+			storePath = filepath.Join(u.HomeDir, ".nino")
 		}
-		storePath = filepath.Join(u.HomeDir, ".nino")
-		err = os.MkdirAll(storePath, 0755)
-		if err != nil {
+		if err := os.MkdirAll(storePath, 0755); err != nil {
 			log.Fatalf("failed to create directory %v", err)
 		}
 		data := filepath.Join(storePath, "nano.db")
@@ -227,10 +262,13 @@ func (schema *Schema) shorten(payload string) (mo.Result[string], bool) {
 		return mo.Ok(payload), false
 	}
 
-	// 1. Detect if the schema needs to evolve by checking for new keys.
+	// generate key mappings for json property, if the original key is one character
+	// string, then don't mapping
 	var schemaEvolved bool
 	for _, key := range longKeys {
-		if _, ok := schema.Mapping[key]; !ok {
+		if len(key) == 1 {
+			schema.Mapping[key] = key
+		} else if _, ok := schema.Mapping[key]; !ok {
 			schema.Mapping[key] = schema.shortKey()
 			schemaEvolved = true
 		}
