@@ -38,21 +38,20 @@ func (ss *SchemaTestSuit) TestShorten() {
 			numOfMapping: 31,
 		},
 	}
-	exists := map[string]any{
+	exists := map[string]string{
 		"c": "simpleTest-c",
 		"d": "simpleTest-d",
-		"p": 1234,
+		"p": "1234",
 	}
 	for _, test := range tests {
-		rs, ok := test.schema.shorten(payload)
-		assert.True(ss.T(), ok)
+		rs, envolved := test.schema.shorten(payload)
 		shorted := rs.MustGet()
 		assert.True(ss.T(), len(shorted) < len(payload))
 		for k, v := range exists {
 			trs := gjson.Get(shorted, k)
 			assert.True(ss.T(), trs.Exists())
-			assert.Equal(ss.T(), v, trs.Value(), "should equal for key %s", k)
+			assert.Equal(ss.T(), v, trs.Str, "should equal for key %s", k)
 		}
-		assert.Equal(ss.T(), test.numOfMapping, len(test.schema.Mapping))
+		assert.Equal(ss.T(), test.numOfMapping, len(envolved.Mapping))
 	}
 }

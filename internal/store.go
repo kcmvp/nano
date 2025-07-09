@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -252,30 +253,24 @@ func (schema *Schema) shortKey() string {
 // shorter, optimized representations based on the schema's mapping.
 // If new fields are encountered, the schema's in-memory mapping is evolved.
 // It returns the shortened JSON and a boolean indicating if the schema was evolved.
-func (schema *Schema) shorten(payload string) (mo.Result[string], bool) {
-	schema.mu.Lock()
-	defer schema.mu.Unlock()
+func (schema *Schema) shorten(payload string) (mo.Result[string], *Schema) {
+	schemaEvolved := schema.Clone()
 	longKeys := lo.Map(gjson.Get(payload, "@keys").Array(), func(item gjson.Result, _ int) string {
 		return item.Str
 	})
 	if len(longKeys) == 0 {
-		return mo.Ok(payload), false
+		return mo.Ok(payload), schemaEvolved
 	}
-
-	// generate key mappings for json property, if the original key is one character
-	// string, then don't mapping
-	var schemaEvolved bool
+	slices.SortFunc(longKeys, func(a, b string) int {
+		return len(a) - len(b)
+	})
 	for _, key := range longKeys {
 		if len(key) == 1 {
-			schema.Mapping[key] = key
-		} else if _, ok := schema.Mapping[key]; !ok {
-			schema.Mapping[key] = schema.shortKey()
-			schemaEvolved = true
+			schemaEvolved.Mapping[key] = key
+		} else if _, ok := schemaEvolved.Mapping[key]; !ok {
+			schemaEvolved.Mapping[key] = schemaEvolved.shortKey()
 		}
 	}
-	// NOTE: Persistence logic is now correctly handled by the caller (SetWithTTL).
-	// The dangerous call to store.schemas.Store has been removed.
-
 	// 2. Perform the transformation without a full unmarshal/marshal cycle.
 	var builder strings.Builder
 	builder.Grow(len(payload))
@@ -283,7 +278,7 @@ func (schema *Schema) shorten(payload string) (mo.Result[string], bool) {
 	var transformErr error
 	first := true
 	gjson.Parse(payload).ForEach(func(key, value gjson.Result) bool {
-		shortKey, ok := schema.Mapping[key.String()]
+		shortKey, ok := schemaEvolved.Mapping[key.String()]
 		if !ok {
 			transformErr = fmt.Errorf("internal error: schema missing key '%s' after evolution", key.String())
 			return false // Stop iterating on error
@@ -299,7 +294,7 @@ func (schema *Schema) shorten(payload string) (mo.Result[string], bool) {
 	})
 
 	if transformErr != nil {
-		return mo.Err[string](transformErr), schemaEvolved
+		return mo.Err[string](transformErr), nil
 	}
 	builder.WriteString("}")
 	return mo.Ok(builder.String()), schemaEvolved
@@ -371,60 +366,43 @@ func (store *Store) SetWithTTL(dbName, key, value string, ttl time.Duration) err
 	if !ok {
 		return fmt.Errorf("db '%s' is not registered", dbName)
 	}
-	originalSchema := val.(*Schema)
-
-	// This will hold the new state of the mapping if the schema evolves.
-	var evolvedMapping map[string]string
-
+	schema := val.(*Schema)
 	// 2. Perform the entire operation in a single, atomic transaction.
+	var evolvedSchema *Schema
+	var evolved bool
 	err := store.impl.Update(func(tx *buntdb.Tx) error {
-		// 3. Work with a temporary copy of the schema inside the transaction.
-		schemaCopy := originalSchema.Clone()
-		// 4. Shorten the payload. This will also evolve schemaCopy's in-memory mapping.
-		shortenedPayloadResult, evolved := schemaCopy.shorten(value)
+		// 3. Shorten the payload. This will also evolve schemaCopy's in-memory mapping.
+		var shortenedPayloadResult mo.Result[string]
+		shortenedPayloadResult, evolvedSchema = schema.shorten(value)
 		if shortenedPayloadResult.IsError() {
 			return shortenedPayloadResult.Error()
 		}
 		// 5. If the schema evolved, persist the updated schema copy to the database.
+		evolved = len(evolvedSchema.Mapping) > len(schema.Mapping)
 		if evolved {
-			data, err := json.Marshal(schemaCopy)
+			data, err := json.Marshal(evolvedSchema)
 			if err != nil {
 				return fmt.Errorf("failed to marshal updated db schema: %w", err)
 			}
-			if _, _, err := tx.Set(schemaCopy.Key(), string(data), nil); err != nil {
+			if _, _, err := tx.Set(evolvedSchema.Key(), string(data), nil); err != nil {
 				return fmt.Errorf("failed to persist updated db schema: %w", err)
 			}
 		}
 
 		// 6. Set the user data in the transaction.
-		var opts *buntdb.SetOptions
-		if ttl > 0 {
-			opts = &buntdb.SetOptions{Expires: true, TTL: ttl}
-		}
-		_, _, err := tx.Set(schemaCopy.dataKey(key), shortenedPayloadResult.MustGet(), opts)
-		if err != nil {
-			return err
-		}
-
-		// 7. Capture the new state of the mapping from the copy.
-		evolvedMapping = schemaCopy.Mapping
-
-		return nil // Returning nil commits the transaction.
+		opts := lo.IfF(ttl > 0, func() *buntdb.SetOptions {
+			return &buntdb.SetOptions{Expires: true, TTL: ttl}
+		}).Else(nil)
+		_, _, err := tx.Set(evolvedSchema.dataKey(key), shortenedPayloadResult.MustGet(), opts)
+		return err
 	})
 
-	// The transaction has finished.
-	if err != nil {
-		return err // The transaction failed and was rolled back. The original schema is untouched.
+	if err == nil && evolved {
+		schema.mu.Lock()
+		schema.Mapping = evolvedSchema.Mapping
+		schema.mu.Unlock()
 	}
-
-	// --- This is the "Success Callback" part ---
-	// The transaction was successful. Now, and only now, we atomically update
-	// the original in-memory schema with the new state.
-	originalSchema.mu.Lock()
-	originalSchema.Mapping = evolvedMapping
-	originalSchema.mu.Unlock()
-
-	return nil
+	return err
 }
 
 // Get retrieves a value by its key for a given database.
