@@ -44,7 +44,7 @@ func (ss *SchemaTestSuit) TestShorten() {
 		"p": "1234",
 	}
 	for _, test := range tests {
-		rs, envolved := test.schema.shorten(payload)
+		rs, evolved := test.schema.shorten(payload)
 		shorted := rs.MustGet()
 		assert.True(ss.T(), len(shorted) < len(payload))
 		for k, v := range exists {
@@ -52,6 +52,6 @@ func (ss *SchemaTestSuit) TestShorten() {
 			assert.True(ss.T(), trs.Exists())
 			assert.Equal(ss.T(), v, trs.Str, "should equal for key %s", k)
 		}
-		assert.Equal(ss.T(), test.numOfMapping, len(envolved.Mapping))
+		assert.Equal(ss.T(), test.numOfMapping, len(evolved.Mapping))
 	}
 }

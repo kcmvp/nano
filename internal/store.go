@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/kcmvp/nano"
 	"github.com/samber/lo"
 	"github.com/samber/mo"
 	"github.com/spf13/viper"
@@ -27,8 +26,13 @@ const (
 	keySeparator      = ":"
 )
 
-var validCharSet = append(lo.LowerCaseLettersCharset, lo.NumbersCharset...)
+// ErrDbExists is returned when attempting to register a database that already exists.
+var ErrDbExists = errors.New("database already exists")
 
+// ErrNamespaceExists is returned when attempting to register a schema that already exists.
+var ErrNamespaceExists = errors.New("namespace already exists")
+
+var validCharSet = append(lo.LowerCaseLettersCharset, lo.NumbersCharset...)
 var store *Store
 var once sync.Once
 var cfg *viper.Viper
@@ -36,21 +40,17 @@ var storePath string
 
 // Store is the main struct for interacting with the database.
 // It encapsulates the buntdb instance and manages schemas for different data types.
-// It is designed as a singleton, accessible via the IS() function.
+// It is designed as a singleton, accessible via the StoreImpl() function.
 type Store struct {
 	impl    *buntdb.DB
-	schemas sync.Map
+	schemas map[string]*Schema
+	mu      sync.RWMutex
 }
 
 func init() {
 	cfg = viper.New()
 	cfg.SetConfigName("app")
 	cfg.SetConfigType("yaml")
-	if executable, err := os.Executable(); err == nil {
-		cfg.AddConfigPath(filepath.Dir(executable))
-	} else {
-		log.Fatalf("could not determine executable path, will not be searched %v", err)
-	}
 	cfg.AddConfigPath(".")
 	cfg.AddConfigPath("../")
 	cfg.AutomaticEnv()
@@ -72,7 +72,7 @@ func DataDir() string {
 	return storePath
 }
 
-func IS() *Store {
+func StoreImpl() *Store {
 	once.Do(func() {
 		storePath = cfg.GetString("nano.data")
 		if len(storePath) < 0 {
@@ -90,9 +90,22 @@ func IS() *Store {
 		if err != nil {
 			log.Fatalf("failed to open database %v", err)
 		}
-		store = &Store{impl: db, schemas: sync.Map{}}
+		store = &Store{impl: db, schemas: map[string]*Schema{}}
 		// reload existing schemas from the store
-		store.loadSchemas()
+		if err = store.impl.View(func(tx *buntdb.Tx) error {
+			return tx.AscendKeys(SchemaSpace(), func(key, value string) bool {
+				schema := &Schema{Name: key[len(schemaSpacePrefix)+len(keySeparator):]}
+				if err := json.Unmarshal([]byte(value), schema); err != nil {
+					log.Printf("WARN: Corrupted schema for key '%s', skipping. Error: %v", key, err)
+					return true // Continue to the next schema
+				}
+				schema.reverseMapping = lo.Invert(schema.Mapping)
+				store.schemas[schema.Name] = schema
+				return true
+			})
+		}); err != nil {
+			log.Fatalf("failed to open database %v", err)
+		}
 	})
 	return store
 }
@@ -106,69 +119,43 @@ func (store *Store) Close() error {
 	return nil
 }
 
-// loadSchemas loads all existing schemas from the database into the in-memory sync.Map.
-// This ensures that the application's schema registry is consistent with the persisted state.
-func (store *Store) loadSchemas() {
-	_ = store.impl.View(func(tx *buntdb.Tx) error {
-		return tx.AscendKeys(SchemaSpace(), func(key, value string) bool {
-			schema := &Schema{Name: key[len(schemaSpacePrefix)+len(keySeparator):]}
-			if err := json.Unmarshal([]byte(value), schema); err != nil {
-				log.Printf("WARN: Corrupted schema for key '%s', skipping. Error: %v", key, err)
-				return true // Continue to the next schema
-			}
-			store.schemas.Store(schema.Name, schema)
-			return true
-		})
-	})
-}
-
-// Key returns the unique key for the schema in the database.
-// This key is used to store and retrieve the schema definition itself.
-// The format is "_schema:schemaName".
-func (schema *Schema) Key() string {
-	return SchemaKey(schema.Name)
-}
-
-// SchemaKey returns the unique key for a schema in the database.
-func SchemaKey(name string) string {
-	return fmt.Sprintf("%s%s%s", schemaSpacePrefix, keySeparator, name)
-}
-
 // Registry registers a new database schema with the store.
-// It ensures that the `dbName` is unique and the `prefix` (namespace) is also unique
-// across all registered schemas. If successful, the schema is persisted to the database
-// and loaded into the in-memory schema registry.
-func (store *Store) Registry(dbName string, prefix string) error {
+// It performs a comprehensive, in-memory pre-check to ensure all new schemas are unique
+// by both name and namespace. If validation passes, it writes all schemas
+// to the database in a single, atomic transaction.
+func (store *Store) Registry(schemas ...*Schema) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	var nameSet []string
+	var namespaceSet []string
+	for _, schema := range store.schemas {
+		nameSet = append(nameSet, schema.Name)
+		namespaceSet = append(namespaceSet, schema.Namespace)
+	}
+	for _, schema := range schemas {
+		if slices.Contains(nameSet, schema.Name) {
+			return fmt.Errorf("%w '%s'", ErrDbExists, schema.Name)
+		}
+		if slices.Contains(namespaceSet, schema.Namespace) {
+			return fmt.Errorf("%w '%s'", ErrNamespaceExists, schema.Namespace)
+		}
+	}
+	// --- Step 2: All checks passed. Perform the atomic database write. ---
 	return store.impl.Update(func(tx *buntdb.Tx) error {
-		// Step 1: Check for dbName existence using the most efficient method.
-		schema := Schema{Name: dbName, Namespace: prefix, Mapping: make(map[string]string)}
-		key := schema.Key()
-		var err error
-		if _, err = tx.Get(key); !errors.Is(err, buntdb.ErrNotFound) {
-			// An error occurred. It's either nil (key found) or a real DB error.
-			if err == nil {
-				return fmt.Errorf("%w:'%s'", nano.ErrDbExists, dbName)
+		for _, schema := range schemas {
+			data, err := json.Marshal(schema)
+			if err != nil {
+				return fmt.Errorf("failed to marshal schema '%s': %w", schema.Name, err)
 			}
-			// A different database error occurred, so we must stop and propagate it.
-			return err
+			// Set the schema in the database.
+			// No need to check for existence again, as the in-memory check is the source of truth.
+			if _, _, err := tx.Set(schema.Key(), string(data), nil); err != nil {
+				return fmt.Errorf("failed to persist schema '%s': %w", schema.Name, err)
+			}
+			// Update the in-memory cache upon successful persistence.
+			store.schemas[schema.Name] = schema
 		}
-		// Check for existing namespace
-		var exists bool
-		if err = tx.AscendKeys(SchemaSpace(), func(_, value string) bool {
-			exists = gjson.Get(value, "namespace").Str == prefix
-			return !exists
-		}); err != nil {
-			return err
-		}
-		if exists {
-			return fmt.Errorf("%w:'%s'", nano.ErrSchemaExists, prefix)
-		}
-		// If not exists, set the new schema and store in registry
-		data, _ := json.Marshal(&schema)
-		if _, _, err = tx.Set(key, string(data), nil); err == nil {
-			store.schemas.Store(schema.Name, &schema)
-		}
-		return err
+		return nil
 	})
 }
 
@@ -190,9 +177,28 @@ type Schema struct {
 	// It's persisted to buntdb to ensure consistency across application restarts.
 	// The key is the original field Name, and the value is the shortened field Name.
 	Mapping map[string]string `json:"mapping"`
+
+	// reverseMapping is a private, in-memory cache for fast rehydration.
+	// As an unexported field, it is automatically ignored by the json package.
+	reverseMapping map[string]string
+
+	// PKProp is the primary key field name for the schema.
+	// This field is used to identify the unique identifier for records within this schema.
+	PKProp string `json:"PKProp"`
+
+	// CreatedAtProp is the name of the property that stores the creation timestamp.
+	CreatedAtProp string `json:"createdAtProp"`
+
+	// UpdatedAtProp is the name of the property that stores the last update timestamp.
+	UpdatedAtProp string `json:"updatedAtProp"`
+
 	// mu is a RWMutex to protect concurrent access to the DB's fields,
 	// especially during schema updates or data access.
 	mu sync.RWMutex
+}
+
+func (schema *Schema) Key() string {
+	return fmt.Sprintf("%s%s%s", schemaSpacePrefix, keySeparator, schema.Name)
 }
 
 // Clone creates a deep copy of the schema, allowing for safe modifications
@@ -255,8 +261,8 @@ func (schema *Schema) shortKey() string {
 // It returns the shortened JSON and a boolean indicating if the schema was evolved.
 func (schema *Schema) shorten(payload string) (mo.Result[string], *Schema) {
 	schemaEvolved := schema.Clone()
-	longKeys := lo.Map(gjson.Get(payload, "@keys").Array(), func(item gjson.Result, _ int) string {
-		return item.Str
+	longKeys := lo.FilterMap(gjson.Get(payload, "@keys").Array(), func(item gjson.Result, _ int) (string, bool) {
+		return item.Str, true
 	})
 	if len(longKeys) == 0 {
 		return mo.Ok(payload), schemaEvolved
@@ -311,14 +317,13 @@ func (schema *Schema) rehydrate(payload string) mo.Result[string] {
 	}
 
 	// Create a reverse map for efficient lookups (short -> long).
-	short2Long := lo.Invert(schema.Mapping)
 	var builder strings.Builder
 	builder.Grow(len(payload))
 	builder.WriteString("{")
 	var transformErr error
 	first := true
 	gjson.Parse(payload).ForEach(func(key, value gjson.Result) bool {
-		longKey, ok := short2Long[key.String()]
+		longKey, ok := schema.reverseMapping[key.String()]
 		if !ok {
 			// A key exists that is not in our schema. This could be a mixed payload
 			// or an error. The safest action is to return the payload as-is
@@ -362,11 +367,12 @@ func (store *Store) Set(dbName, key, value string) error {
 // A TTL of 0 means the key will not expire.
 func (store *Store) SetWithTTL(dbName, key, value string, ttl time.Duration) error {
 	// 1. Load the original schema.
-	val, ok := store.schemas.Load(dbName)
+	store.mu.RLock()
+	schema, ok := store.schemas[dbName]
+	store.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("db '%s' is not registered", dbName)
 	}
-	schema := val.(*Schema)
 	// 2. Perform the entire operation in a single, atomic transaction.
 	var evolvedSchema *Schema
 	var evolved bool
@@ -400,6 +406,7 @@ func (store *Store) SetWithTTL(dbName, key, value string, ttl time.Duration) err
 	if err == nil && evolved {
 		schema.mu.Lock()
 		schema.Mapping = evolvedSchema.Mapping
+		schema.reverseMapping = lo.Invert(schema.Mapping)
 		schema.mu.Unlock()
 	}
 	return err
@@ -409,12 +416,12 @@ func (store *Store) SetWithTTL(dbName, key, value string, ttl time.Duration) err
 // The retrieved data is automatically "rehydrated" to its original, long-key format.
 func (store *Store) Get(dbName, key string) mo.Result[string] {
 	// 1. Load the schema.
-	val, ok := store.schemas.Load(dbName)
+	store.mu.RLock()
+	schema, ok := store.schemas[dbName]
+	store.mu.RUnlock()
 	if !ok {
 		return mo.Err[string](fmt.Errorf("db '%s' is not registered", dbName))
 	}
-	schema := val.(*Schema)
-
 	// 2. Retrieve the data in a read-only transaction.
 	var shortenedPayload string
 	err := store.impl.View(func(tx *buntdb.Tx) error {
