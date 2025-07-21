@@ -14,7 +14,6 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,7 +22,7 @@ import (
 
 const (
 	schemaSpacePrefix = "_schema"
-	keySeparator      = ":"
+	keySep            = ":"
 )
 
 // ErrDbExists is returned when attempting to register a database that already exists.
@@ -45,6 +44,14 @@ type Store struct {
 	impl    *buntdb.DB
 	schemas map[string]*Schema
 	mu      sync.RWMutex
+}
+
+func KeyPair(key string) (prefix, name string) {
+	items := strings.Split(key, keySep)
+	lo.Assert(len(items) == 2, "invalid key %s", key)
+	prefix = items[0]
+	name = items[1]
+	return
 }
 
 func init() {
@@ -75,7 +82,7 @@ func DataDir() string {
 func StoreImpl() *Store {
 	once.Do(func() {
 		storePath = cfg.GetString("nano.data")
-		if len(storePath) < 0 {
+		if len(storePath) == 0 {
 			u, err := user.Current()
 			if err != nil {
 				log.Fatalf("failed to get current user %v", err)
@@ -91,10 +98,12 @@ func StoreImpl() *Store {
 			log.Fatalf("failed to open database %v", err)
 		}
 		store = &Store{impl: db, schemas: map[string]*Schema{}}
-		// reload existing schemas from the store
 		if err = store.impl.View(func(tx *buntdb.Tx) error {
 			return tx.AscendKeys(SchemaSpace(), func(key, value string) bool {
-				schema := &Schema{Name: key[len(schemaSpacePrefix)+len(keySeparator):]}
+				//prefix, name := KeyPair(strings.TrimPrefix(key, schemaPrefix))
+				items := strings.Split(key, keySep)
+				items = items[len(items)-2:]
+				schema := &Schema{Name: items[0], space: items[1]}
 				if err := json.Unmarshal([]byte(value), schema); err != nil {
 					log.Printf("WARN: Corrupted schema for key '%s', skipping. Error: %v", key, err)
 					return true // Continue to the next schema
@@ -110,6 +119,14 @@ func StoreImpl() *Store {
 	return store
 }
 
+// Schemas returns all registered schemas in the store.
+// This function provides a snapshot of the currently active schemas,
+// allowing external components to inspect their definitions, including
+// their names, namespaces, and field mappings.
+func Schemas() []*Schema {
+	return lo.Values(store.schemas)
+}
+
 // Close closes the underlying buntdb database.
 // It should be called when the application is shutting down.
 func (store *Store) Close() error {
@@ -119,6 +136,10 @@ func (store *Store) Close() error {
 	return nil
 }
 
+func (store *Store) space(schema string) string {
+	panic("")
+}
+
 // Registry registers a new database schema with the store.
 // It performs a comprehensive, in-memory pre-check to ensure all new schemas are unique
 // by both name and namespace. If validation passes, it writes all schemas
@@ -126,29 +147,35 @@ func (store *Store) Close() error {
 func (store *Store) Registry(schemas ...*Schema) error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	var nameSet []string
-	var namespaceSet []string
-	for _, schema := range store.schemas {
-		nameSet = append(nameSet, schema.Name)
-		namespaceSet = append(namespaceSet, schema.Namespace)
-	}
-	for _, schema := range schemas {
-		if slices.Contains(nameSet, schema.Name) {
-			return fmt.Errorf("%w '%s'", ErrDbExists, schema.Name)
+	spaces := lo.MapValues(store.schemas, func(schema *Schema, key string) string {
+		return schema.space
+	})
+	// update target schemas or registry a new one
+	if target, ok := lo.Find(schemas, func(item *Schema) bool {
+		if !lo.HasKey(spaces, item.Name) {
+			spaces[item.Name] = ""
+			return false
 		}
-		if slices.Contains(namespaceSet, schema.Namespace) {
-			return fmt.Errorf("%w '%s'", ErrNamespaceExists, schema.Namespace)
-		}
+		return true
+	}); ok {
+		existing, _ := store.schemas[target.Name]
+		lo.Assert(existing != nil, "can not find schema %s", target.Name)
+		acceptable := existing.migrate(target)
+		fmt.Println(acceptable)
+
+		return fmt.Errorf("%w '%s'", ErrDbExists, target.Name)
 	}
+	altos(spaces)
 	// --- Step 2: All checks passed. Perform the atomic database write. ---
 	return store.impl.Update(func(tx *buntdb.Tx) error {
 		for _, schema := range schemas {
+			space, ok := spaces[schema.Name]
+			lo.Assert(ok, "can not find space for schema '%s'", schema.Name)
+			schema.space = space
 			data, err := json.Marshal(schema)
 			if err != nil {
 				return fmt.Errorf("failed to marshal schema '%s': %w", schema.Name, err)
 			}
-			// Set the schema in the database.
-			// No need to check for existence again, as the in-memory check is the source of truth.
 			if _, _, err := tx.Set(schema.Key(), string(data), nil); err != nil {
 				return fmt.Errorf("failed to persist schema '%s': %w", schema.Name, err)
 			}
@@ -159,46 +186,74 @@ func (store *Store) Registry(schemas ...*Schema) error {
 	})
 }
 
-// Schema represents the structure and mapping rules for a specific "database"
+// Schema represents the structure and altos rules for a specific "database"
 // within the buntdb store. It defines how original field names are mapped to
 // shorter, optimized keys for storage efficiency.
 type Schema struct {
 
 	// Name is the unique identifier for the schema (e.g., "users", "products").
 	Name string `json:"-"`
-	// Namespace is a unique prefix for all keys belonging to this DB.
+	// space is a unique prefix for all keys belonging to this DB.
 	// It helps in isolating data for different logical databases within the same buntdb instance.
-	// For example, if Namespace is "u", all keys for this DB will be stored as "u:key".
-	// Namespace is typically a single character or a short string to minimize storage overhead.
-	Namespace string `json:"namespace"`
+	// For example, if space is "u", all keys for this DB will be stored as "u:key".
+	// space is typically a single character or a altos string to minimize storage overhead.
+	space string
 
 	// Mapping stores the Mapping between original JSON field names and their shortened representations.
 	// This map is used for optimizing storage by replacing long field names with shorter ones (e.g., "firstName" -> "f1").
 	// It's persisted to buntdb to ensure consistency across application restarts.
 	// The key is the original field Name, and the value is the shortened field Name.
-	Mapping map[string]string `json:"mapping"`
+	Mapping map[string]string `json:"altos"`
 
 	// reverseMapping is a private, in-memory cache for fast rehydration.
 	// As an unexported field, it is automatically ignored by the json package.
 	reverseMapping map[string]string
 
-	// PKProp is the primary key field name for the schema.
-	// This field is used to identify the unique identifier for records within this schema.
-	PKProp string `json:"PKProp"`
+	// IdProp is the name of the field that uniquely identifies a record within the schema.
+	IdProp string `json:"idProp"`
 
-	// CreatedAtProp is the name of the property that stores the creation timestamp.
+	// CreatedAtProp is the name of the field that stores the creation timestamp of a record.
 	CreatedAtProp string `json:"createdAtProp"`
 
-	// UpdatedAtProp is the name of the property that stores the last update timestamp.
+	// UpdatedAtProp is the name of the field that stores the last update timestamp of a record.
 	UpdatedAtProp string `json:"updatedAtProp"`
+
+	// StatusProps are the status fields that store the status value of a record
+	StatusProps []string `json:"statusProps"`
 
 	// mu is a RWMutex to protect concurrent access to the DB's fields,
 	// especially during schema updates or data access.
 	mu sync.RWMutex
 }
 
+func (schema *Schema) migrate(target *Schema) error {
+	panic("")
+}
+
+func Blueprint(name, id, createdAt, updatedAt string, status ...string) *Schema {
+	mapping := map[string]string{}
+	if len(createdAt) > 0 {
+		mapping[createdAt] = "c"
+	}
+	if len(updatedAt) > 0 {
+		mapping[updatedAt] = "u"
+	}
+	return &Schema{
+		Name:           name,
+		IdProp:         id,
+		CreatedAtProp:  createdAt,
+		UpdatedAtProp:  updatedAt,
+		Mapping:        mapping,
+		reverseMapping: lo.Invert(mapping),
+	}
+}
+
+func (schema *Schema) ID() string {
+	return fmt.Sprintf("%s%s%s", schema.Name, keySep, schema.space)
+}
+
 func (schema *Schema) Key() string {
-	return fmt.Sprintf("%s%s%s", schemaSpacePrefix, keySeparator, schema.Name)
+	return fmt.Sprintf("%s%s%s", schemaSpacePrefix, keySep, schema.ID())
 }
 
 // Clone creates a deep copy of the schema, allowing for safe modifications
@@ -212,52 +267,26 @@ func (schema *Schema) Clone() *Schema {
 		newMapping[k] = v
 	}
 	return &Schema{
-		Name:      schema.Name,
-		Namespace: schema.Namespace,
-		Mapping:   newMapping,
+		Name:    schema.Name,
+		space:   schema.space,
+		Mapping: newMapping,
 	}
+}
+
+func (schema *Schema) NameSpace() string {
+	return fmt.Sprintf("%s%s%s*", schema.space, keySep)
 }
 
 // SchemaSpace returns the schema string for system-level keys.
 // These keys are used internally to manage registered databases and their prefixes.
 // The format is "_schema:*", which matches all keys starting with "_schema:".
 func SchemaSpace() string {
-	return fmt.Sprintf("%s%s*", schemaSpacePrefix, keySeparator)
-}
-
-// shortKey generates a unique short key for a new field in the schema.
-// It prioritizes single-character lowercase letters (a-z).
-// If all single characters are used, it moves to two-character keys,
-// starting with a lowercase letter and followed by any character from `validCharSet` (a-z, 0-9).
-// This ensures a compact and deterministic key generation.
-func (schema *Schema) shortKey() string {
-	usedShortKeys := lo.Keyify(lo.Values(schema.Mapping))
-	// Policy 1: Find the first available single-character key.
-	// singleCharSet is already sorted 'a' through 'z'.
-	for _, char := range lo.LowerCaseLettersCharset {
-		cs := string(char)
-		if _, ok := usedShortKeys[cs]; !ok {
-			return cs
-		}
-	}
-	// Policy 2: All single characters are used. Find the first available two-character key.
-	// This deterministic loop is more robust and predictable than random generation.
-	for _, c1 := range lo.LowerCaseLettersCharset {
-		for _, c2 := range validCharSet {
-			key := string(c1) + string(c2)
-			if _, ok := usedShortKeys[key]; !ok {
-				return key
-			}
-		}
-	}
-	// Fallback for the highly unlikely case that all 962 (26 + 26*36) keys are used.
-	// This prevents an infinite loop and ensures the system can continue.
-	return fmt.Sprintf("k%d", len(usedShortKeys))
+	return fmt.Sprintf("%s%s*", schemaSpacePrefix, keySep)
 }
 
 // shorten transforms a JSON payload by replacing original field names with their
-// shorter, optimized representations based on the schema's mapping.
-// If new fields are encountered, the schema's in-memory mapping is evolved.
+// shorter, optimized representations based on the schema's altos.
+// If new fields are encountered, the schema's in-memory altos is evolved.
 // It returns the shortened JSON and a boolean indicating if the schema was evolved.
 func (schema *Schema) shorten(payload string) (mo.Result[string], *Schema) {
 	schemaEvolved := schema.Clone()
@@ -267,16 +296,12 @@ func (schema *Schema) shorten(payload string) (mo.Result[string], *Schema) {
 	if len(longKeys) == 0 {
 		return mo.Ok(payload), schemaEvolved
 	}
-	slices.SortFunc(longKeys, func(a, b string) int {
-		return len(a) - len(b)
-	})
-	for _, key := range longKeys {
-		if len(key) == 1 {
-			schemaEvolved.Mapping[key] = key
-		} else if _, ok := schemaEvolved.Mapping[key]; !ok {
-			schemaEvolved.Mapping[key] = schemaEvolved.shortKey()
+	lo.ForEach(longKeys, func(key string, _ int) {
+		if _, ok := schemaEvolved.Mapping[key]; !ok {
+			schemaEvolved.Mapping[key] = ""
 		}
-	}
+	})
+	altos(schema.Mapping)
 	// 2. Perform the transformation without a full unmarshal/marshal cycle.
 	var builder strings.Builder
 	builder.Grow(len(payload))
@@ -316,7 +341,7 @@ func (schema *Schema) rehydrate(payload string) mo.Result[string] {
 		return mo.Ok(payload) // No schema or not a valid JSON object, so nothing to do.
 	}
 
-	// Create a reverse map for efficient lookups (short -> long).
+	// Create a reverse map for efficient lookups (altos -> long).
 	var builder strings.Builder
 	builder.Grow(len(payload))
 	builder.WriteString("{")
@@ -353,7 +378,7 @@ func (schema *Schema) rehydrate(payload string) mo.Result[string] {
 // dataKey constructs the actual key used to store user data.
 // It combines the schema's namespace with the user-provided key.
 func (schema *Schema) dataKey(key string) string {
-	return fmt.Sprintf("%s%s%s", schema.Namespace, keySeparator, key)
+	return fmt.Sprintf("%s%s%s", schema.space, keySep, key)
 }
 
 // Set saves a key-value pair for a given database.
@@ -377,7 +402,7 @@ func (store *Store) SetWithTTL(dbName, key, value string, ttl time.Duration) err
 	var evolvedSchema *Schema
 	var evolved bool
 	err := store.impl.Update(func(tx *buntdb.Tx) error {
-		// 3. Shorten the payload. This will also evolve schemaCopy's in-memory mapping.
+		// 3. Shorten the payload. This will also evolve schemaCopy's in-memory altos.
 		var shortenedPayloadResult mo.Result[string]
 		shortenedPayloadResult, evolvedSchema = schema.shorten(value)
 		if shortenedPayloadResult.IsError() {
@@ -439,4 +464,41 @@ func (store *Store) Get(dbName, key string) mo.Result[string] {
 
 	// 3. Rehydrate the payload before returning it.
 	return schema.rehydrate(shortenedPayload)
+}
+
+func altos(entries map[string]string) {
+	used := map[string]struct{}{}
+	notMapped := lo.PickBy(entries, func(key string, value string) bool {
+		if len(value) == 0 {
+			used[value] = struct{}{}
+		}
+		return len(value) == 0
+	})
+	var notFilledErr = fmt.Errorf("not filled")
+	for l, _ := range notMapped {
+		// 36
+		if _, err := lo.Attempt(len(validCharSet), func(index int) error {
+			key := string(validCharSet[index])
+			if !lo.HasKey(used, key) {
+				entries[l] = key
+				used[key] = struct{}{}
+				return nil
+			}
+			return notFilledErr
+		}); err != nil {
+			// 26 * 36 = 936
+			_, _ = lo.Attempt(len(lo.LowerCaseLettersCharset), func(index int) error {
+				f := lo.LowerCaseLettersCharset[index]
+				for _, r := range validCharSet {
+					key := fmt.Sprintf("%c%c", f, r)
+					if !lo.HasKey(used, key) {
+						entries[l] = key
+						used[key] = struct{}{}
+						return nil
+					}
+				}
+				return notFilledErr
+			})
+		}
+	}
 }

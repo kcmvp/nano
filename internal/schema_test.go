@@ -28,11 +28,11 @@ func (ss *SchemaTestSuit) TestShorten() {
 		numOfMapping int
 	}{
 		{
-			schema:       &Schema{Name: "sonarcube1", Namespace: "a", Mapping: make(map[string]string)},
+			schema:       &Schema{Name: "sonarcube1", space: "a", Mapping: make(map[string]string)},
 			numOfMapping: 30,
 		},
 		{
-			schema: &Schema{Name: "sonarcube2", Namespace: "b", Mapping: map[string]string{
+			schema: &Schema{Name: "sonarcube2", space: "b", Mapping: map[string]string{
 				"abc": "a",
 			}},
 			numOfMapping: 31,

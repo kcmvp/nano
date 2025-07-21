@@ -36,8 +36,8 @@ func TestStoreTestSuit(t *testing.T) {
 func (st *StoreTestSuit) TestRegistry() {
 	var err error
 	schema := &Schema{
-		Name:      lo.RandomString(10, lo.LowerCaseLettersCharset),
-		Namespace: lo.RandomString(5, lo.LowerCaseLettersCharset),
+		Name:  lo.RandomString(10, lo.LowerCaseLettersCharset),
+		space: lo.RandomString(5, lo.LowerCaseLettersCharset),
 	}
 	err = StoreImpl().Registry(schema)
 	assert.Nil(st.T(), err)
@@ -47,7 +47,7 @@ func (st *StoreTestSuit) TestRegistry() {
 		return err
 	})
 	assert.Nil(st.T(), err, "database should be registered successfully")
-	assert.True(st.T(), len(value) > 0 && gjson.Get(value, "namespace").Str == schema.Namespace)
+	assert.True(st.T(), len(value) > 0 && gjson.Get(value, "namespace").Str == schema.space)
 	v, ok := StoreImpl().schemas[schema.Name]
 	assert.True(st.T(), ok)
 	assert.Equal(st.T(), v.Name, schema.Name)
@@ -67,29 +67,43 @@ func (st *StoreTestSuit) TestRegistry() {
 
 	// register another database
 	schema2 := &Schema{
-		Name:      fmt.Sprintf("%s%s", lo.RandomString(3, lo.LowerCaseLettersCharset), schema.Name),
-		Namespace: lo.RandomString(5, lo.LowerCaseLettersCharset),
+		Name:  fmt.Sprintf("%s%s", lo.RandomString(3, lo.LowerCaseLettersCharset), schema.Name),
+		space: lo.RandomString(5, lo.LowerCaseLettersCharset),
 	}
 	err = StoreImpl().Registry(schema2)
 	assert.Nil(st.T(), err, "should not throw error %s", schema2.Name)
-	//
-	//var dbs []string
-	//_ = StoreImpl().impl.View(func(tx *buntdb.Tx) error {
-	//	return tx.AscendKeys(SchemaSpace(), func(key, value string) bool {
-	//		if strings.HasSuffix(key, basic) {
-	//			dbs = append(dbs, key)
-	//		}
-	//		return true
-	//	})
-	//})
-	//assert.Len(st.T(), dbs, 2)
-	//assert.True(st.T(), lo.EveryBy(dbs, func(item string) bool {
-	//	return strings.HasSuffix(item, basic) && strings.HasPrefix(item, schemaSpacePrefix)
-	//}), "should have suffix %s", basic)
-	//lo.ForEach(lo.Map(dbs, func(item string, _ int) string {
-	//	return strings.Split(item, keySeparator)[1]
-	//}), func(item string, _ int) {
-	//	_, ok = StoreImpl().schemas[item]
-	//	assert.True(st.T(), ok, "db should also exists in cache")
-	//})
+
+	cachedSchemas := Schemas()
+	assert.Equal(st.T(), 2, len(cachedSchemas))
+}
+
+func Test_mapping(t *testing.T) {
+	tests := []struct {
+		name string
+		l2s  map[string]string
+	}{
+		{
+			name: "test altos",
+			l2s: map[string]string{
+				"name": "name",
+				"age":  "",
+			},
+		},
+		{
+			name: "test altos with different keys",
+			l2s: map[string]string{
+				"first_name": "firstName",
+				"last_name":  "",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			altos(tt.l2s)
+			for _, v := range tt.l2s {
+				assert.Truef(t, len(v) > 0, "key is %s", v)
+			}
+		})
+
+	}
 }

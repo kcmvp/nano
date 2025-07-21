@@ -2,6 +2,7 @@ package nano
 
 import (
 	"github.com/kcmvp/nano/internal"
+	"github.com/samber/lo"
 	"slices"
 )
 
@@ -12,20 +13,17 @@ import (
 // Upon successful registration, a new DB instance is created and stored in the registry.
 // When save a key/value pair, the key will be prefixed the namespace automatically.
 func Register(schemas ...*Schema) error {
-	var rawSchemas []*internal.Schema
 	var nameSet []string
-	var namespaceSet []string
+	var blueprints []*internal.Schema
 	for _, schema := range schemas {
-		if slices.Contains(nameSet, schema.internalSchema.Name) {
-			return internal.ErrDbExists
-		} else if slices.Contains(namespaceSet, schema.internalSchema.Namespace) {
-			return internal.ErrNamespaceExists
-		}
-		nameSet = append(nameSet, schema.internalSchema.Name)
-		namespaceSet = append(namespaceSet, schema.internalSchema.Namespace)
-		rawSchemas = append(rawSchemas, schema.internalSchema)
+		lo.Assertf(slices.Contains(nameSet, schema.name), "duplicated schema %s", schema.name)
+		nameSet = append(nameSet, schema.name)
+		blueprints = append(blueprints, internal.Blueprint(schema.name, string(schema.id), string(schema.createdAt), string(schema.updatedAt),
+			lo.Map(lo.Keys(schema.status), func(item JsonProperty, _ int) string {
+				return string(item)
+			})...))
 	}
-	return internal.StoreImpl().Registry(rawSchemas...)
+	return internal.StoreImpl().Registry(blueprints...)
 }
 
 //
